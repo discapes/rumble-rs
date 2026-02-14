@@ -13,6 +13,7 @@ use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources, tcp::TcpSocket};
 use embassy_time::{Duration, Timer};
 use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::clock::CpuClock;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
@@ -50,6 +51,11 @@ macro_rules! mk_static {
 }
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+/// Find a two-byte marker (e.g. SOI=0xFFD8, EOI=0xFFD9) in a byte slice.
+fn find_marker(data: &[u8], b0: u8, b1: u8) -> Option<usize> {
+    data.windows(2).position(|w| w[0] == b0 && w[1] == b1)
+}
 
 const SSID: &str = "ylikellotus";
 const PASSWORD: &str = "alakerta";
@@ -99,7 +105,7 @@ async fn main(spawner: Spawner) -> ! {
     let cs = Output::new(peripherals.GPIO6, Level::High, OutputConfig::default());
     let spi_device = ExclusiveDevice::new(spi, cs, delay).unwrap();
 
-    let spi_buffer = mk_static!([u8; 512], [0u8; 512]);
+    let spi_buffer = mk_static!([u8; 10240], [0u8; 10240]);
     let di = SpiInterface::new(spi_device, dc, spi_buffer);
 
     let mut display = mipidsi::Builder::new(mipidsi::models::ST7789, di)
@@ -158,8 +164,9 @@ async fn main(spawner: Spawner) -> ! {
     // -----------------------------------------------------------------------
     // MJPEG streaming loop
     // -----------------------------------------------------------------------
-    let mut rx_buffer = [0u8; 4096];
-    let mut tx_buffer = [0u8; 1024];
+    // Heap-allocated TCP buffers — larger RX = larger TCP window = better throughput
+    let mut rx_buffer = vec![0u8; 16384];
+    let mut tx_buffer = vec![0u8; 1024];
 
     // Frame accumulation buffer (~30KB on heap)
     let mut frame_buf: Vec<u8> = vec![0u8; 30 * 1024];
@@ -199,46 +206,50 @@ async fn main(spawner: Spawner) -> ! {
                 }
             };
 
-            // Scan received bytes for JPEG SOI/EOI markers
-            let mut i = 0;
-            while i < n {
+            // Scan received chunk for JPEG SOI/EOI markers using bulk copy
+            let mut pos = 0;
+            while pos < n {
                 if !in_frame {
-                    // Look for SOI marker: 0xFF 0xD8
-                    if i + 1 < n && tcp_buf[i] == 0xFF && tcp_buf[i + 1] == 0xD8 {
+                    // Scan for SOI marker (0xFF 0xD8) in remaining data
+                    if let Some(soi) = find_marker(&tcp_buf[pos..n], 0xFF, 0xD8) {
                         frame_len = 0;
                         in_frame = true;
-                        // Don't skip — let the SOI be copied into frame_buf
-                    } else if tcp_buf[i] == 0xFF && i + 1 == n {
-                        // Potential split SOI — peek next read; for now skip
-                        i += 1;
-                        continue;
+                        pos += soi; // advance to SOI start
                     } else {
-                        i += 1;
-                        continue;
+                        break; // no SOI in this chunk
                     }
                 }
 
-                // Accumulate into frame buffer
-                if frame_len < frame_buf.len() {
-                    frame_buf[frame_len] = tcp_buf[i];
-                    frame_len += 1;
-                } else {
+                // Bulk copy remaining tcp data into frame_buf
+                let space = frame_buf.len() - frame_len;
+                let avail = n - pos;
+                let copy_len = avail.min(space);
+                if copy_len == 0 {
                     // Frame too large, discard
                     in_frame = false;
                     frame_len = 0;
-                    i += 1;
+                    pos += 1;
                     continue;
                 }
 
-                // Check for EOI marker: 0xFF 0xD9
-                if frame_len >= 2
-                    && frame_buf[frame_len - 2] == 0xFF
-                    && frame_buf[frame_len - 1] == 0xD9
-                {
-                    // Complete JPEG frame received
+                frame_buf[frame_len..frame_len + copy_len]
+                    .copy_from_slice(&tcp_buf[pos..pos + copy_len]);
+
+                // Scan for EOI in newly copied data (check cross-boundary too)
+                let scan_start = if frame_len > 0 { frame_len - 1 } else { 0 };
+                frame_len += copy_len;
+                pos += copy_len;
+
+                if let Some(eoi) = find_marker(&frame_buf[scan_start..frame_len], 0xFF, 0xD9) {
+                    let eoi_end = scan_start + eoi + 2;
                     in_frame = false;
 
-                    let jpeg_data = &mut frame_buf[..frame_len];
+                    // Rewind pos: we consumed past the EOI, put leftover back
+                    let consumed_past_eoi = frame_len - eoi_end;
+                    pos -= consumed_past_eoi;
+
+                    // Decode and display the complete JPEG frame
+                    let jpeg_data = &mut frame_buf[..eoi_end];
                     match decoder.decode(jpeg_data, |block_idx, block_width, block_height, data| {
                         let start_row = (block_idx as u16) * block_height;
 
@@ -255,32 +266,23 @@ async fn main(spawner: Spawner) -> ! {
                         let end_row = start_row + visible_rows - 1;
                         let pixel_count = (block_width as usize) * (visible_rows as usize);
 
-                        // Convert RGB565-LE bytes to Rgb565 pixel iterator
-                        let pixels = (0..pixel_count).map(|j| {
-                            let lo = data[j * 2];
-                            let hi = data[j * 2 + 1];
-                            let raw = u16::from_le_bytes([lo, hi]);
-                            Rgb565::new(
-                                ((raw >> 11) & 0x1F) as u8,
-                                ((raw >> 5) & 0x3F) as u8,
-                                (raw & 0x1F) as u8,
+                        // Direct cast: decoder outputs RGB565-LE which matches native u16
+                        // layout on this little-endian CPU. Rgb565 wraps RawU16(u16).
+                        let pixels = unsafe {
+                            core::slice::from_raw_parts(
+                                data.as_ptr() as *const u16,
+                                pixel_count,
                             )
-                        });
-
+                        };
                         let _ = display.set_pixels(
                             0,
                             start_row,
                             block_width - 1,
                             end_row,
-                            pixels,
+                            pixels.iter().map(|&raw| Rgb565::from(RawU16::new(raw))),
                         );
                     }) {
-                        Ok(info) => {
-                            println!(
-                                "frame decoded: {}x{}, {} bytes",
-                                info.width, info.height, frame_len
-                            );
-                        }
+                        Ok(_) => {}
                         Err(e) => {
                             println!("decode error: {}", e);
                         }
@@ -288,8 +290,6 @@ async fn main(spawner: Spawner) -> ! {
 
                     frame_len = 0;
                 }
-
-                i += 1;
             }
         }
     }
