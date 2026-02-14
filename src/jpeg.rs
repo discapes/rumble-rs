@@ -12,7 +12,7 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
 
-pub const JPEG_PIXEL_FORMAT_RGB565_LE: u32 = fourcc(b'R', b'L', b'1', b'6');
+pub const JPEG_PIXEL_FORMAT_RGB565_LE: u32 = fourcc(b'R', b'G', b'B', b'L');
 
 // ---------------------------------------------------------------------------
 // Repr(C) structs matching the C header definitions
