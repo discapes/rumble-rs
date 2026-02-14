@@ -26,8 +26,8 @@ embassy-net = { version = "0.7.1", features = [
   "tcp",
   "udp",
 ] }
-embedded-io = "0.7.1"
-embedded-io-async = "0.7.0"
+embedded-io = "0.6.1"
+embedded-io-async = "0.6.1"
 esp-alloc = "0.9.0"
 # for more networking protocol support see https://crates.io/crates/edge-net
 embassy-executor = { version = "0.9.1", features = [] }
@@ -51,6 +51,13 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ] }
+
+esp-println = { version = "0.16.0", features = ["esp32s3"] }
+
+mipidsi = "0.9.0"
+embedded-graphics = "0.8.1"
+embedded-hal-bus = "0.3.0"
+embedded-hal = "1.0"
 
 critical-section = "1.2.0"
 static_cell      = "2.1.1"

@@ -1,5 +1,13 @@
 fn main() {
     linker_be_nice();
+
+    // Link the esp_new_jpeg C library for JPEG decoding
+    println!(
+        "cargo:rustc-link-search=native={}/esp-adf-libs/esp_new_jpeg/lib/esp32s3",
+        std::env::var("CARGO_MANIFEST_DIR").unwrap()
+    );
+    println!("cargo:rustc-link-lib=static=esp_new_jpeg");
+
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
