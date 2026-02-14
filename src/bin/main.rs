@@ -193,7 +193,7 @@ async fn main(spawner: Spawner) -> ! {
 
         let mut tcp_buf = [0u8; 4096];
 
-        loop {
+        'recv: loop {
             let n = match embedded_io_async::Read::read(&mut socket, &mut tcp_buf).await {
                 Ok(0) => {
                     println!("connection closed");
@@ -210,13 +210,12 @@ async fn main(spawner: Spawner) -> ! {
             let mut pos = 0;
             while pos < n {
                 if !in_frame {
-                    // Scan for SOI marker (0xFF 0xD8) in remaining data
                     if let Some(soi) = find_marker(&tcp_buf[pos..n], 0xFF, 0xD8) {
                         frame_len = 0;
                         in_frame = true;
-                        pos += soi; // advance to SOI start
+                        pos += soi;
                     } else {
-                        break; // no SOI in this chunk
+                        break;
                     }
                 }
 
@@ -225,7 +224,6 @@ async fn main(spawner: Spawner) -> ! {
                 let avail = n - pos;
                 let copy_len = avail.min(space);
                 if copy_len == 0 {
-                    // Frame too large, discard
                     in_frame = false;
                     frame_len = 0;
                     pos += 1;
@@ -235,60 +233,84 @@ async fn main(spawner: Spawner) -> ! {
                 frame_buf[frame_len..frame_len + copy_len]
                     .copy_from_slice(&tcp_buf[pos..pos + copy_len]);
 
-                // Scan for EOI in newly copied data (check cross-boundary too)
                 let scan_start = if frame_len > 0 { frame_len - 1 } else { 0 };
                 frame_len += copy_len;
                 pos += copy_len;
 
                 if let Some(eoi) = find_marker(&frame_buf[scan_start..frame_len], 0xFF, 0xD9) {
                     let eoi_end = scan_start + eoi + 2;
-                    in_frame = false;
 
-                    // Rewind pos: we consumed past the EOI, put leftover back
-                    let consumed_past_eoi = frame_len - eoi_end;
-                    pos -= consumed_past_eoi;
-
-                    // Decode and display the complete JPEG frame
+                    // --- Decode with per-block yield ---
                     let jpeg_data = &mut frame_buf[..eoi_end];
-                    match decoder.decode(jpeg_data, |block_idx, block_width, block_height, data| {
-                        let start_row = (block_idx as u16) * block_height;
+                    match decoder.start_decode(jpeg_data) {
+                        Ok(mut session) => {
+                            for block_idx in 0..session.block_count() {
+                                let (block_width, block_height) = match session.decode_next_block()
+                                {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        println!("block decode error: {}", e);
+                                        break;
+                                    }
+                                };
 
-                        // Clamp to display height
-                        let visible_rows = if start_row + block_height > DISPLAY_HEIGHT {
-                            if start_row >= DISPLAY_HEIGHT {
-                                return;
+                                let start_row = (block_idx as u16) * block_height;
+                                let visible_rows =
+                                    if start_row + block_height > DISPLAY_HEIGHT {
+                                        if start_row >= DISPLAY_HEIGHT {
+                                            continue;
+                                        }
+                                        DISPLAY_HEIGHT - start_row
+                                    } else {
+                                        block_height
+                                    };
+                                let end_row = start_row + visible_rows - 1;
+                                let pixel_count =
+                                    (block_width as usize) * (visible_rows as usize);
+
+                                let data = session.block_data();
+                                let pixels = unsafe {
+                                    core::slice::from_raw_parts(
+                                        data.as_ptr() as *const u16,
+                                        pixel_count,
+                                    )
+                                };
+                                let _ = display.set_pixels(
+                                    0,
+                                    start_row,
+                                    block_width - 1,
+                                    end_row,
+                                    pixels.iter().map(|&raw| Rgb565::from(RawU16::new(raw))),
+                                );
+
+                                // Yield to let the network task process TCP ACKs
+                                embassy_futures::yield_now().await;
                             }
-                            DISPLAY_HEIGHT - start_row
-                        } else {
-                            block_height
-                        };
-
-                        let end_row = start_row + visible_rows - 1;
-                        let pixel_count = (block_width as usize) * (visible_rows as usize);
-
-                        // Direct cast: decoder outputs RGB565-LE which matches native u16
-                        // layout on this little-endian CPU. Rgb565 wraps RawU16(u16).
-                        let pixels = unsafe {
-                            core::slice::from_raw_parts(
-                                data.as_ptr() as *const u16,
-                                pixel_count,
-                            )
-                        };
-                        let _ = display.set_pixels(
-                            0,
-                            start_row,
-                            block_width - 1,
-                            end_row,
-                            pixels.iter().map(|&raw| Rgb565::from(RawU16::new(raw))),
-                        );
-                    }) {
-                        Ok(_) => {}
+                        }
                         Err(e) => {
                             println!("decode error: {}", e);
                         }
                     }
 
+                    // --- Frame dropping: drain stale data from the socket ---
+                    // After decode+display, the TCP buffer may have accumulated
+                    // multiple frames. Drain them so we always show the latest.
                     frame_len = 0;
+                    in_frame = false;
+                    loop {
+                        match embassy_time::with_timeout(
+                            Duration::from_ticks(1),
+                            embedded_io_async::Read::read(&mut socket, &mut tcp_buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) => break 'recv, // connection closed
+                            Ok(Ok(_)) => continue,    // discard stale data
+                            Ok(Err(_)) => break 'recv,
+                            Err(_) => break,           // timeout = no more queued data
+                        }
+                    }
+                    break; // back to main read loop with empty state
                 }
             }
         }

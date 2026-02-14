@@ -283,6 +283,120 @@ impl JpegDecoder {
     }
 }
 
+/// Step-by-step decode session. Allows yielding to the async executor between
+/// blocks so the network task can process TCP ACKs during display writes.
+pub struct DecodeSession<'a> {
+    decoder: &'a mut JpegDecoder,
+    io: JpegDecIo,
+    info: JpegFrameInfo,
+    outbuf: *mut c_void,
+    block_count: usize,
+    current_block: usize,
+    header_width: u16,
+}
+
+impl JpegDecoder {
+    /// Begin decoding a JPEG frame. Returns a session that yields one block at a time.
+    pub fn start_decode<'a>(
+        &'a mut self,
+        jpeg_data: &mut [u8],
+    ) -> Result<DecodeSession<'a>, i32> {
+        let mut io = JpegDecIo {
+            inbuf: jpeg_data.as_mut_ptr(),
+            inbuf_len: jpeg_data.len() as i32,
+            inbuf_remain: 0,
+            outbuf: ptr::null_mut(),
+            out_size: 0,
+        };
+
+        let mut header = JpegDecHeaderInfo {
+            width: 0,
+            height: 0,
+        };
+        let ret = unsafe { jpeg_dec_parse_header(self.handle, &mut io, &mut header) };
+        if ret != 0 {
+            return Err(ret);
+        }
+
+        let mut outbuf_len: i32 = 0;
+        let ret = unsafe { jpeg_dec_get_outbuf_len(self.handle, &mut outbuf_len) };
+        if ret != 0 {
+            return Err(ret);
+        }
+
+        let outbuf = unsafe { jpeg_calloc_align(outbuf_len as usize, 16) };
+        if outbuf.is_null() {
+            return Err(-2);
+        }
+        io.outbuf = outbuf as *mut u8;
+
+        let mut process_count: i32 = 0;
+        let ret = unsafe { jpeg_dec_get_process_count(self.handle, &mut process_count) };
+        if ret != 0 {
+            unsafe { jpeg_free_align(outbuf) };
+            return Err(ret);
+        }
+
+        Ok(DecodeSession {
+            decoder: self,
+            io,
+            info: JpegFrameInfo {
+                width: header.width,
+                height: header.height,
+            },
+            outbuf,
+            block_count: process_count as usize,
+            current_block: 0,
+            header_width: header.width,
+        })
+    }
+}
+
+impl<'a> DecodeSession<'a> {
+    pub fn info(&self) -> &JpegFrameInfo {
+        &self.info
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    /// Decode the next block. Returns `(block_width, block_height)`.
+    /// The decoded pixel data is available via `block_data()` until the next call.
+    pub fn decode_next_block(&mut self) -> Result<(u16, u16), i32> {
+        if self.current_block >= self.block_count {
+            return Err(-3); // no more blocks
+        }
+        self.io.out_size = 0;
+        let ret = unsafe { jpeg_dec_process(self.decoder.handle, &mut self.io) };
+        if ret != 0 {
+            return Err(ret);
+        }
+        self.current_block += 1;
+
+        let block_width = self.header_width;
+        let block_height = if block_width > 0 {
+            (self.io.out_size as u16) / (block_width * 2)
+        } else {
+            0
+        };
+        Ok((block_width, block_height))
+    }
+
+    /// Raw RGB565-LE pixel data for the most recently decoded block.
+    pub fn block_data(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.io.outbuf, self.io.out_size as usize) }
+    }
+}
+
+impl<'a> Drop for DecodeSession<'a> {
+    fn drop(&mut self) {
+        if !self.outbuf.is_null() {
+            unsafe { jpeg_free_align(self.outbuf) };
+        }
+    }
+}
+
 impl Drop for JpegDecoder {
     fn drop(&mut self) {
         if !self.handle.is_null() {
